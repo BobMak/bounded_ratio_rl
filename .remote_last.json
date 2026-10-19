@@ -1,0 +1,28 @@
+{
+  "module": "cli_args",
+  "remotes": [
+    {
+      "name": "CI2_WS",
+      "jobs": [
+        ""
+      ],
+      "workers": 1,
+      "gpus": [
+        0,
+        1
+      ],
+      "range_template": ""
+    },
+    {
+      "name": "GLOBAL_HOME_WS",
+      "jobs": [
+        ""
+      ],
+      "workers": 1,
+      "gpus": [
+        0
+      ],
+      "range_template": ""
+    }
+  ]
+}

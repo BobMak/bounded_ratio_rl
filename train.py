@@ -1,3 +1,9 @@
+import os
+
+# headless machines have no display for MuJoCo's default GLFW backend
+if "DISPLAY" not in os.environ:
+    os.environ.setdefault("MUJOCO_GL", "egl")
+
 import gymnasium as gym
 from stable_baselines3.common.vec_env import VecVideoRecorder
 import wandb

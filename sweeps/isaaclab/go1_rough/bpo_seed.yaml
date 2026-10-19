@@ -7,7 +7,7 @@ name: BPO_go1_rough_random_seeds_clip03_epoch10_ent0005_kl02
 method: grid
 metric:
   goal: maximize
-  name: total_reward
+  name: Train/mean_reward
 parameters:
   agent.seed:
     values: [1, 2, 3, 4, 5]
@@ -19,5 +19,6 @@ command:
   - ${program}
   - "--headless"
   - "--task=Isaac-Velocity-Rough-Unitree-Go1-v0"
+  - "--algorithm=bpo"
   - "--logger=wandb"
   - ${args_no_hyphens}

@@ -1,4 +1,4 @@
-program: main.py
+program: train.py
 name: random_seed_ppo_Hopper_v4
 method: grid
 metric:

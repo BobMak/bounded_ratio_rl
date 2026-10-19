@@ -5,7 +5,7 @@ defaults:
 
 wandb:
   project: BPO
-  entity: {your-entity-name}
+  entity: vladmak
   monitor_gym: true
   save_code: true
 

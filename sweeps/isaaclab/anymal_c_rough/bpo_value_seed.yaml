@@ -7,7 +7,7 @@ name: BPO_value_anymal_rough_random_seeds_clip025_epoch5
 method: grid
 metric:
   goal: maximize
-  name: total_reward
+  name: Train/mean_reward
 parameters:
   agent.seed:
     values: [1, 2, 3, 4, 5]
@@ -19,5 +19,6 @@ command:
   - ${program}
   - "--headless"
   - "--task=Isaac-Velocity-Rough-Anymal-C-v0"
+  - "--algorithm=bpo"
   - "--logger=wandb"
   - ${args_no_hyphens}

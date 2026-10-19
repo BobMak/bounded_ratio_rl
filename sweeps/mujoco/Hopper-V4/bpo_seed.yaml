@@ -1,5 +1,5 @@
 program: train.py
-name: random_seed_ppo_Hopper_v4
+name: random_seed_bpo_Hopper_v4
 method: grid
 metric:
   goal: maximize

@@ -1,0 +1,21 @@
+{
+  "remotes": [
+    {
+      "name": "CI2_WS",
+      "host": "vmakaren@ci2-lab.ttu.edu",
+      "remote_dir": "/home2/vmakaren/bounded_ratio_rl"
+    },
+    {
+      "name": "GLOBAL_HOME_WS",
+      "host": "vlad@98.207.87.6",
+      "remote_dir": "/home/vlad/projects/bounded_ratio_rl"
+    }
+  ],
+  "sync": {
+    "mode": "source",
+    "include": [],
+    "exclude": []
+  },
+  "data_dir_remote": "results",
+  "data_dir_local": "results"
+}
