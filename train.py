@@ -4,6 +4,7 @@ import os
 if "DISPLAY" not in os.environ:
     os.environ.setdefault("MUJOCO_GL", "egl")
 
+import torch
 import gymnasium as gym
 from stable_baselines3.common.vec_env import VecVideoRecorder
 import wandb
@@ -17,6 +18,7 @@ gym.register_envs(ale_py)
 
 @hydra.main(version_base=None, config_path="cfgs", config_name="config")
 def main(cfg : DictConfig):
+    torch.set_num_threads(cfg.training.get("torch_threads", 1))
     config = OmegaConf.to_container(cfg, resolve=True)
     print(OmegaConf.to_yaml(cfg))
     wandb_cfg = OmegaConf.to_container(cfg.wandb, resolve=True)

@@ -14,3 +14,5 @@ training:
   gradient_save_freq: 100_000
   n_envs: 8
   seed: 42
+  # intra-op torch threads per run; 1 is fastest for small nets and lets seeds run in parallel
+  torch_threads: 1

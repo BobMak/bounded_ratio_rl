@@ -14,7 +14,9 @@ from stable_baselines3.common.policies import (
     MultiInputActorCriticPolicy,
 )
 from .policy import BPOPolicy, BPOCnnPolicy
+from .adaptive_clip import AdaptiveClipController
 from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.distributions import CategoricalDistribution, DiagGaussianDistribution
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from torch.nn import functional as F
 
@@ -52,6 +54,18 @@ class BPO(OnPolicyAlgorithm):
     :param use_median: Whether to use median value function for the loss calculation
     :param clip_ratio: The clipping ratio, it can be a function
         of the current progress remaining (from 1 to 0)
+    :param adaptive_clip: If True, adapt clip_ratio after every update so that the exact
+        mean KL(pi_old || pi_new) over the rollout tracks ``clip_target_kl``. The initial
+        value is ``clip_ratio`` (or its schedule at progress 1); the schedule is otherwise ignored.
+    :param clip_target_kl: Target per-update mean KL divergence for the adaptive bound
+    :param clip_adapt_rate: Log-space step size of the controller (max factor e**rate per update)
+    :param clip_min: Lower limit for the adaptive bound
+    :param clip_max: Upper limit for the adaptive bound (must be < 1)
+    :param controlled_eps: "Controlled eps" variant, so that the ratio bound (not gradient
+        clipping) is what limits the policy step: (1) the |Q - V| weight of the policy loss is
+        divided by its minibatch mean, removing its reward-scale dependence; (2) actor and
+        critic gradients are norm-clipped separately (each to ``max_grad_norm``), so the large
+        value/u-loss gradients no longer shrink the actor update through a joint clip.
     :param max_grad_norm: The maximum value for the gradient clipping
     :param use_sde: Whether to use generalized State Dependent Exploration (gSDE)
         instead of action noise exploration (default: False)
@@ -99,6 +113,12 @@ class BPO(OnPolicyAlgorithm):
         u_coef: float = 0.5,
         use_median: bool = True,
         clip_ratio: Union[float, Schedule] = 0.3,
+        adaptive_clip: bool = False,
+        clip_target_kl: float = 0.02,
+        clip_adapt_rate: float = 0.5,
+        clip_min: float = 0.02,
+        clip_max: float = 0.9,
+        controlled_eps: bool = False,
         max_grad_norm: float = 1.0,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
@@ -173,11 +193,96 @@ class BPO(OnPolicyAlgorithm):
             self.clip_ratio_schedule = clip_ratio
         self.u_coef = u_coef
 
+        self.controlled_eps = controlled_eps
+        self.adaptive_clip = adaptive_clip
+        self.clip_controller: Optional[AdaptiveClipController] = None
+        if adaptive_clip:
+            self.clip_controller = AdaptiveClipController(
+                init_eps=self.clip_ratio_schedule(1.0),
+                target=clip_target_kl,
+                rate=clip_adapt_rate,
+                eps_min=clip_min,
+                eps_max=clip_max,
+            )
+
         if _init_setup_model:
             self._setup_model()
 
     def _setup_model(self) -> None:
         super()._setup_model()
+        # actor-only parameters (policy MLP, action head, log_std); everything else
+        # (critic MLP, value/u heads, any shared feature extractor) is the critic group
+        actor_mods = [self.policy.mlp_extractor.policy_net, self.policy.action_net]
+        actor_ids = {id(p) for m in actor_mods for p in m.parameters()}
+        if isinstance(getattr(self.policy, "log_std", None), th.nn.Parameter):
+            actor_ids.add(id(self.policy.log_std))
+        self._actor_params = [p for p in self.policy.parameters() if id(p) in actor_ids]
+        self._critic_params = [p for p in self.policy.parameters() if id(p) not in actor_ids]
+
+    @staticmethod
+    @th.no_grad()
+    def _total_grad_norm(params: list) -> th.Tensor:
+        """L2 norm over all grads, without syncing (th.nn.utils.get_total_norm needs torch>=2.6)."""
+        grads = [p.grad for p in params if p.grad is not None]
+        if hasattr(th, "_foreach_norm"):
+            norms = th._foreach_norm(grads)  # one fused kernel instead of one per parameter
+        else:
+            norms = [g.norm() for g in grads]
+        return th.linalg.vector_norm(th.stack(norms))
+
+    @staticmethod
+    def _detached_dist(dist: th.distributions.Distribution) -> Optional[th.distributions.Distribution]:
+        """Frozen copy of a torch distribution (Normal / Categorical), or None if unsupported."""
+        if isinstance(dist, th.distributions.Normal):
+            return th.distributions.Normal(dist.loc.detach(), dist.scale.detach())
+        if isinstance(dist, th.distributions.Categorical):
+            return th.distributions.Categorical(logits=dist.logits.detach())
+        return None
+
+    @th.no_grad()
+    def _policy_dists(self, obs: th.Tensor, chunk: int = 4096) -> list:
+        """Detached action distributions of the current policy over obs, in fixed chunks."""
+        out = []
+        for i in range(0, obs.shape[0], chunk):
+            dist = self.policy.get_distribution(obs[i : i + chunk]).distribution
+            out.append(self._detached_dist(dist) if not isinstance(dist, list) else None)
+        return out
+
+    @th.no_grad()
+    def _measure_update(self, obs, actions, old_log_prob, old_dists, chunk: int = 4096) -> dict:
+        """Divergence between the pre-update and post-update policy on the rollout."""
+        new_dists = self._policy_dists(obs, chunk)
+        # log-probs straight from the new distribution (saves a second full forward pass
+        # through evaluate_actions); only where that matches SB3's log_prob exactly
+        fast_lp = isinstance(
+            self.policy.action_dist, (DiagGaussianDistribution, CategoricalDistribution)
+        ) and not self.policy.squash_output
+        kls, log_probs = [], []
+        for k, i in enumerate(range(0, obs.shape[0], chunk)):
+            o, n = old_dists[k], new_dists[k]
+            if o is not None and n is not None:
+                kl = th.distributions.kl_divergence(o, n)
+                if isinstance(n, th.distributions.Normal):
+                    kl = kl.sum(-1)
+                kls.append(kl.flatten())
+            a = actions[i : i + chunk]
+            if fast_lp and n is not None:
+                lp = n.log_prob(a)
+                if isinstance(n, th.distributions.Normal):
+                    lp = lp.sum(-1)
+            else:
+                lp = self.policy.evaluate_actions(obs[i : i + chunk], a)[2]
+            log_probs.append(lp.flatten())
+        log_ratio = th.cat(log_probs) - old_log_prob.flatten()
+        ratio = th.exp(log_ratio)
+        stats = {
+            # k3 estimator of KL(old||new), always available
+            "kl_k3": th.mean((ratio - 1) - log_ratio).item(),
+            # sample estimate of TV(old, new) = 0.5 E_old|r - 1|
+            "tv_sample": 0.5 * th.mean(th.abs(ratio - 1)).item(),
+        }
+        stats["kl_exact"] = th.cat(kls).mean().item() if kls and len(kls) == len(old_dists) else stats["kl_k3"]
+        return stats
 
     def train(self) -> None:
         """
@@ -195,7 +300,21 @@ class BPO(OnPolicyAlgorithm):
         else:
             # Fallback if total_timesteps not available yet
             progress_remaining = 1.0
-        clip_ratio = self.clip_ratio_schedule(progress_remaining)
+        if self.clip_controller is not None:
+            clip_ratio = self.clip_controller.eps
+        else:
+            clip_ratio = self.clip_ratio_schedule(progress_remaining)
+
+        # Snapshot the pre-update policy on the whole rollout (fixed order) so the
+        # realized divergence of this update can be measured exactly afterwards.
+        full = next(self.rollout_buffer.get(None))
+        full_actions = full.actions
+        if isinstance(self.action_space, spaces.Discrete):
+            full_actions = full_actions.long().flatten()
+        old_dists = self._policy_dists(full.observations)
+
+        # last-epoch diagnostics of how well the ratio reaches the target
+        attain, direction_ok, target_mean, ratio_dev, grad_norms, pi_grad_norms = [], [], [], [], [], []
 
         entropy_losses = []
         pg_losses, value_losses, u_losses = [], [], []
@@ -225,7 +344,7 @@ class BPO(OnPolicyAlgorithm):
                 q_values = rollout_data.returns.flatten()
                 target_values = rollout_data.returns.flatten()
                 value_loss = F.mse_loss(target_values, values)
-                value_losses.append(value_loss.item())
+                value_losses.append(value_loss.detach())
 
                 # u loss
                 if self.use_median:
@@ -234,11 +353,11 @@ class BPO(OnPolicyAlgorithm):
                         th.nn.functional.softplus(adv * self.lambda_)
                         - 0.5 * adv * self.lambda_
                     )
-                    u_losses.append(u_loss.item())
+                    u_losses.append(u_loss.detach())
                 else:
                     adv = (q_values - values) / self.lambda_
                     u_loss = th.zeros_like(value_loss)
-                    u_losses.append(0.0)
+                    u_losses.append(u_loss.detach())
 
                 # policz loss
                 with th.no_grad():
@@ -251,10 +370,20 @@ class BPO(OnPolicyAlgorithm):
                 target_log_ratio = th.log(target_ratio)
                 log_ratio = log_prob.flatten() - rollout_data.old_log_prob.flatten()
                 ratio = th.exp(log_ratio)
-                policy_loss = th.mean(
-                    th.abs((ratio - target_ratio).flatten() * (q_values - values.detach()))
-                )
-                pg_losses.append(policy_loss.item())
+                if epoch == self.n_epochs - 1:
+                    with th.no_grad():
+                        r, rt = ratio.detach(), target_ratio.flatten()
+                        attain.append((th.abs(r - rt) < 0.1 * clip_ratio).float().mean())
+                        direction_ok.append(
+                            (th.sign(r - 1) == th.sign(rt - 1)).float().mean()
+                        )
+                        target_mean.append(rt.mean())
+                        ratio_dev.append(th.abs(r - 1).mean())
+                pg_weight = th.abs(q_values - values.detach())
+                if self.controlled_eps:
+                    pg_weight = pg_weight / (pg_weight.mean() + 1e-8)
+                policy_loss = th.mean(th.abs((ratio - target_ratio).flatten()) * pg_weight)
+                pg_losses.append(policy_loss.detach())
 
                 if entropy is None:
                     # Approximate entropy when no analytical form
@@ -262,7 +391,7 @@ class BPO(OnPolicyAlgorithm):
                 else:
                     entropy_loss = -th.mean(entropy)
 
-                entropy_losses.append(entropy_loss.item())
+                entropy_losses.append(entropy_loss.detach())
 
                 p_coef = 1.0
                 loss = p_coef * policy_loss + self.vf_coef * value_loss + self.u_coef * u_loss + self.ent_coef * entropy_loss
@@ -270,32 +399,57 @@ class BPO(OnPolicyAlgorithm):
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 with th.no_grad():
                     log_ratio = log_prob - rollout_data.old_log_prob
-                    approx_kl_div = (
-                        th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-                    )
-                    approx_kl_divs.append(approx_kl_div)
+                    approx_kl_divs.append(th.mean((th.exp(log_ratio) - 1) - log_ratio))
 
                 # Optimization step
                 self.policy.optimizer.zero_grad()
                 loss.backward()
                 # Clip grad norm
-                th.nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), self.max_grad_norm
-                )
+                if self.controlled_eps:
+                    gn_pi = th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm)
+                    gn_vf = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
+                    grad_norms.append(gn_pi.detach())
+                else:
+                    gn_pi = self._total_grad_norm(self._actor_params)
+                    grad_norms.append(
+                        th.nn.utils.clip_grad_norm_(
+                            self.policy.parameters(), self.max_grad_norm
+                        ).detach()
+                    )
+                pi_grad_norms.append(gn_pi.detach())
                 self.policy.optimizer.step()
 
             self._n_updates += 1
             if not continue_training:
                 break
 
-        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
-        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
-        self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("train/u_loss", np.mean(u_losses))
-        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        # single device->host sync for all per-minibatch metrics
+        _mean = lambda xs: th.stack(xs).float().mean().item() if xs else float("nan")
+        self.logger.record("train/entropy_loss", _mean(entropy_losses))
+        self.logger.record("train/policy_gradient_loss", _mean(pg_losses))
+        self.logger.record("train/value_loss", _mean(value_losses))
+        self.logger.record("train/u_loss", _mean(u_losses))
+        self.logger.record("train/approx_kl", _mean(approx_kl_divs))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/lambda", self.lambda_)
         self.logger.record("train/clip_ratio", clip_ratio)
+
+        div = self._measure_update(full.observations, full_actions, full.old_log_prob, old_dists)
+        for k, v in div.items():
+            self.logger.record(f"train/{k}", v)
+        self.logger.record("train/target_attainment", _mean(attain))
+        self.logger.record("train/target_direction_ok", _mean(direction_ok))
+        self.logger.record("train/target_ratio_mean", _mean(target_mean))
+        self.logger.record("train/ratio_abs_dev", _mean(ratio_dev))
+        grad_norms_t = th.stack(grad_norms).float()
+        self.logger.record("train/grad_norm_preclip", grad_norms_t.mean().item())
+        # grad_clip_frac: fraction of minibatches where the clip that governs the actor fired
+        # (joint clip by default, actor-only clip with controlled_eps)
+        self.logger.record("train/grad_clip_frac", (grad_norms_t > self.max_grad_norm).float().mean().item())
+        self.logger.record("train/grad_norm_pi_preclip", _mean(pi_grad_norms))
+        if self.clip_controller is not None:
+            next_eps = self.clip_controller.update(div["kl_exact"])
+            self.logger.record("train/clip_ratio_next", next_eps)
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 

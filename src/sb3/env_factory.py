@@ -41,6 +41,8 @@ def create_mujoco_env(
     n_envs: int = 1,
     render_mode: str = "rgb_array",
     seed: Optional[int] = None,
+    n_steps: Optional[int] = None,
+    task_name: Optional[str] = None,
     **kwargs
 ):
     """
@@ -51,6 +53,8 @@ def create_mujoco_env(
         n_envs: Number of parallel environments
         render_mode: Render mode for the environment
         seed: Random seed for environment
+        n_steps: Config metadata only (the rollout length is set by the algo config); ignored
+        task_name: Config metadata only; ignored
         **kwargs: Additional arguments passed to gym.make
 
     Returns:

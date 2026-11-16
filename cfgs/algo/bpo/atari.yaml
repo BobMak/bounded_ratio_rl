@@ -30,3 +30,11 @@ clip_ratio: 0.3
 verbose: 1
 max_grad_norm: 1.0
 use_median: True
+# adaptive ratio bound: adapt clip_ratio so per-update exact KL(old||new) tracks clip_target_kl
+adaptive_clip: False
+clip_target_kl: 0.02
+clip_adapt_rate: 0.5
+clip_min: 0.02
+clip_max: 0.9
+# controlled-eps variant: normalized |Q-V| policy weight + separate actor/critic grad clipping
+controlled_eps: False
