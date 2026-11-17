@@ -34,6 +34,20 @@ use_median: True
 adaptive_clip: False
 clip_target_kl: 0.02
 clip_adapt_rate: 0.5
+# clip_mode: target = track clip_target_kl; climb = +clip_climb_step per update, x clip_cut when
+# KL > clip_kl_ceiling or KL > clip_spike_ratio * median(last clip_window), then hold clip_cooldown
+clip_mode: target
+clip_climb_step: 0.03
+clip_cut: 0.7
+clip_kl_ceiling: 0.5
+clip_spike_ratio: 1.5
+clip_window: 5
+clip_cooldown: 3
+# spike test on KL / eps**clip_kl_power (0 = raw KL); climb-only extras below
+clip_kl_power: 2.0
+clip_momentum: 0.0
+clip_noise: 0.0
+clip_rollback: False
 clip_min: 0.02
 clip_max: 0.9
 # controlled-eps variant: normalized |Q-V| policy weight + separate actor/critic grad clipping

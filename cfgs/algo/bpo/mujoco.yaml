@@ -22,7 +22,7 @@ lambda_: 0.001
 ent_coef: 0.0
 vf_coef: 0.5
 u_coef: 0.5
-clip_ratio: 0.3
+clip_ratio: ${oc.select:algo.per_env.${env.env_id}.clip_ratio,0.3}
 verbose: 1
 # small MLP + minibatch 64: CPU beats GPU (kernel-launch / transfer overhead dominates)
 device: cpu
@@ -32,6 +32,20 @@ use_median: True
 adaptive_clip: False
 clip_target_kl: 0.02
 clip_adapt_rate: 0.5
+# clip_mode: target = track clip_target_kl; climb = +clip_climb_step per update, x clip_cut when
+# KL > clip_kl_ceiling or KL > clip_spike_ratio * median(last clip_window), then hold clip_cooldown
+clip_mode: target
+clip_climb_step: 0.03
+clip_cut: 0.7
+clip_kl_ceiling: 0.5
+clip_spike_ratio: 1.5
+clip_window: 5
+clip_cooldown: 3
+# spike test on KL / eps**clip_kl_power (0 = raw KL); climb-only extras below
+clip_kl_power: 2.0
+clip_momentum: 0.0
+clip_noise: 0.0
+clip_rollback: False
 clip_min: 0.02
 clip_max: 0.9
 # controlled-eps variant: normalized |Q-V| policy weight + separate actor/critic grad clipping
@@ -53,10 +67,14 @@ state_kl_max: ${oc.select:algo.per_env.${env.env_id}.state_kl_max,0.05}
 #   Ant          norm 1884 vs raw 1735 at 5M (tie, seed spread ~250); Swimmer: everything ties (~120)
 # mask with state_kl_max=0.02 collapsed training on every env -- keep the budget >= ~2x the mean
 # per-update KL (train/kl_exact ~0.015-0.035 here).
+# adaptive_clip_best_v2 (1M, 3 seeds): fixed eps 0.3->0.6 gives Ant 30->619, HalfCheetah 2130->4338,
+# Humanoid 402->489; KL-target controller matches fixed eps at matched eps.
+# adaptive_clip_best_v3: eps 0.7/0.8 -> Ant 882/1039, HalfCheetah 3260/2116 (seeds collapse; 0.6 = 4338),
+# Humanoid 517/537; Hopper eps 0.2/0.4 = 1577/2087 (0.3: 2108), Walker2d 541/421 (0.3+mask: 1262).
 per_env:
-  HalfCheetah-v5: {normalize: true}
-  Humanoid-v5: {normalize: true}
+  HalfCheetah-v5: {normalize: true, clip_ratio: 0.6}
+  Humanoid-v5: {normalize: true, clip_ratio: 0.8}
   Hopper-v5: {normalize: true, norm_obs: false}
   Walker2d-v5: {normalize: false, state_clip: mask, state_kl_max: 0.05}
-  Ant-v5: {normalize: false}
+  Ant-v5: {normalize: false, clip_ratio: 0.8}
   Swimmer-v5: {normalize: false}
