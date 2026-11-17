@@ -34,6 +34,8 @@ def main(cfg : DictConfig):
 
     algo_cfg = OmegaConf.to_container(cfg.algo, resolve=True)
     algo_cfg['tensorboard_log'] = f"runs/{run.id}"
+    # config-only key (per-env defaults, already resolved into env.* / algo.* above)
+    algo_cfg.pop('per_env', None)
     model = instantiate(algo_cfg, env=env)
     model.learn(
         total_timesteps=cfg.training.total_timesteps,
@@ -43,6 +45,11 @@ def main(cfg : DictConfig):
             verbose=2,
         ),
     )
+    vec_norm = model.get_vec_normalize_env()
+    if vec_norm is not None:
+        # running obs/return statistics are needed to evaluate or resume the saved policy
+        os.makedirs(f"models/{run.id}", exist_ok=True)
+        vec_norm.save(f"models/{run.id}/vec_normalize.pkl")
     run.finish()
 
 

@@ -119,6 +119,8 @@ class BPO(OnPolicyAlgorithm):
         clip_min: float = 0.02,
         clip_max: float = 0.9,
         controlled_eps: bool = False,
+        state_clip: Optional[str] = None,
+        state_kl_max: float = 0.05,
         max_grad_norm: float = 1.0,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
@@ -194,6 +196,12 @@ class BPO(OnPolicyAlgorithm):
         self.u_coef = u_coef
 
         self.controlled_eps = controlled_eps
+        if state_clip not in (None, "mask", "scale"):
+            raise ValueError(f"state_clip must be None, 'mask' or 'scale', got {state_clip!r}")
+        if state_clip is not None and state_kl_max <= 0:
+            raise ValueError(f"state_kl_max must be > 0, got {state_kl_max}")
+        self.state_clip = state_clip
+        self.state_kl_max = float(state_kl_max)
         self.adaptive_clip = adaptive_clip
         self.clip_controller: Optional[AdaptiveClipController] = None
         if adaptive_clip:
@@ -307,11 +315,28 @@ class BPO(OnPolicyAlgorithm):
 
         # Snapshot the pre-update policy on the whole rollout (fixed order) so the
         # realized divergence of this update can be measured exactly afterwards.
-        full = next(self.rollout_buffer.get(None))
+        # The snapshot is taken in the buffer's native (flattened) order so minibatches can
+        # index into it; minibatches are drawn exactly like RolloutBuffer.get does.
+        rb = self.rollout_buffer
+        n_samples = rb.buffer_size * rb.n_envs
+        if not rb.generator_ready:
+            next(rb.get(n_samples))  # flattens the buffer in place
+        full = rb._get_samples(np.arange(n_samples))
         full_actions = full.actions
         if isinstance(self.action_space, spaces.Discrete):
             full_actions = full_actions.long().flatten()
         old_dists = self._policy_dists(full.observations)
+
+        # per-state bound: frozen pre-update distribution parameters for every sample
+        old_params = None
+        if self.state_clip is not None:
+            if any(d is None for d in old_dists):
+                raise ValueError("state_clip needs a Normal or Categorical action distribution")
+            if isinstance(old_dists[0], th.distributions.Normal):
+                old_params = ("normal", th.cat([d.loc for d in old_dists]), th.cat([d.scale for d in old_dists]))
+            else:
+                old_params = ("categorical", th.cat([d.logits for d in old_dists]))
+        state_kls, state_clip_fracs, state_eps = [], [], []
 
         # last-epoch diagnostics of how well the ratio reaches the target
         attain, direction_ok, target_mean, ratio_dev, grad_norms, pi_grad_norms = [], [], [], [], [], []
@@ -326,7 +351,10 @@ class BPO(OnPolicyAlgorithm):
             approx_kl_divs = []
             # First train values
 
-            for rollout_data in self.rollout_buffer.get(self.batch_size):
+            perm = np.random.permutation(n_samples)
+            for start in range(0, n_samples, self.batch_size):
+                batch_inds = perm[start : start + self.batch_size]
+                rollout_data = rb._get_samples(batch_inds)
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
@@ -335,6 +363,8 @@ class BPO(OnPolicyAlgorithm):
                 values, u_values, log_prob, entropy = self.policy.evaluate_actions(
                     rollout_data.observations, actions
                 )
+                # SB3 distributions return themselves, so this is this minibatch's pi_theta
+                cur_dist = self.policy.action_dist.distribution
 
 
                 values = values.flatten()
@@ -362,10 +392,34 @@ class BPO(OnPolicyAlgorithm):
                 # policz loss
                 with th.no_grad():
                     adv_d = adv.detach()
+                    # per-state bound: exact KL(pi_old(s) || pi_theta(s)) for each state
+                    state_w, eps_s = None, clip_ratio
+                    if old_params is not None:
+                        idx = th.as_tensor(batch_inds, device=self.device)
+                        if old_params[0] == "normal":
+                            old_d = th.distributions.Normal(old_params[1][idx], old_params[2][idx])
+                            kl_s = th.distributions.kl_divergence(old_d, cur_dist).sum(-1)
+                        else:
+                            old_d = th.distributions.Categorical(logits=old_params[1][idx])
+                            kl_s = th.distributions.kl_divergence(old_d, cur_dist)
+                        kl_s = kl_s.flatten()
+                        over = kl_s > self.state_kl_max
+                        if self.state_clip == "mask":
+                            # state has used up its divergence budget: stop pushing it
+                            state_w = (~over).float()
+                        else:
+                            # shrink this state's bound; KL ~ eps^2, hence the sqrt
+                            eps_s = clip_ratio * th.clamp(
+                                th.sqrt(self.state_kl_max / kl_s.clamp_min(1e-12)), max=1.0
+                            )
+                        if epoch == self.n_epochs - 1:
+                            state_kls.append(kl_s)
+                            state_clip_fracs.append(over.float().mean())
+                            state_eps.append(th.as_tensor(eps_s, dtype=th.float32).mean())
                 target_ratio = (
                     1
-                    - clip_ratio
-                    + 2 * clip_ratio * th.nn.functional.sigmoid(adv_d)
+                    - eps_s
+                    + 2 * eps_s * th.nn.functional.sigmoid(adv_d)
                 )
                 target_log_ratio = th.log(target_ratio)
                 log_ratio = log_prob.flatten() - rollout_data.old_log_prob.flatten()
@@ -382,6 +436,10 @@ class BPO(OnPolicyAlgorithm):
                 pg_weight = th.abs(q_values - values.detach())
                 if self.controlled_eps:
                     pg_weight = pg_weight / (pg_weight.mean() + 1e-8)
+                if state_w is not None:
+                    # mean over all samples (not just unmasked) so the loss scale doesn't
+                    # jump as states drop out, like PPO's clipped samples
+                    pg_weight = pg_weight * state_w
                 policy_loss = th.mean(th.abs((ratio - target_ratio).flatten()) * pg_weight)
                 pg_losses.append(policy_loss.detach())
 
@@ -447,6 +505,13 @@ class BPO(OnPolicyAlgorithm):
         # (joint clip by default, actor-only clip with controlled_eps)
         self.logger.record("train/grad_clip_frac", (grad_norms_t > self.max_grad_norm).float().mean().item())
         self.logger.record("train/grad_norm_pi_preclip", _mean(pi_grad_norms))
+        if state_kls:
+            kl_all = th.cat(state_kls).float()
+            self.logger.record("train/state_kl_mean", kl_all.mean().item())
+            self.logger.record("train/state_kl_p90", th.quantile(kl_all, 0.9).item())
+            self.logger.record("train/state_kl_max", kl_all.max().item())
+            self.logger.record("train/state_clip_frac", _mean(state_clip_fracs))
+            self.logger.record("train/state_eps_mean", _mean(state_eps))
         if self.clip_controller is not None:
             next_eps = self.clip_controller.update(div["kl_exact"])
             self.logger.record("train/clip_ratio_next", next_eps)

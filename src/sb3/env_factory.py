@@ -4,7 +4,7 @@ These can be instantiated via Hydra's instantiate mechanism.
 """
 import gymnasium as gym
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecNormalize
 from stable_baselines3.common.env_util import make_atari_env
 from typing import Optional
 
@@ -43,6 +43,12 @@ def create_mujoco_env(
     seed: Optional[int] = None,
     n_steps: Optional[int] = None,
     task_name: Optional[str] = None,
+    normalize: bool = False,
+    norm_obs: bool = True,
+    norm_reward: bool = True,
+    norm_gamma: float = 0.99,
+    clip_obs: float = 10.0,
+    clip_reward: float = 10.0,
     **kwargs
 ):
     """
@@ -55,6 +61,12 @@ def create_mujoco_env(
         seed: Random seed for environment
         n_steps: Config metadata only (the rollout length is set by the algo config); ignored
         task_name: Config metadata only; ignored
+        normalize: Wrap in VecNormalize (running obs/return statistics). Monitor sits
+            inside, so logged episode returns stay unnormalized.
+        norm_obs / norm_reward: Which streams VecNormalize normalizes
+        norm_gamma: Discount for the running return used to scale rewards; should match
+            the algorithm's gamma
+        clip_obs / clip_reward: Clipping applied after normalization
         **kwargs: Additional arguments passed to gym.make
 
     Returns:
@@ -69,5 +81,14 @@ def create_mujoco_env(
     env = DummyVecEnv(envs)
     if seed is not None:
         env.seed(seed)
+    if normalize:
+        env = VecNormalize(
+            env,
+            norm_obs=norm_obs,
+            norm_reward=norm_reward,
+            gamma=norm_gamma,
+            clip_obs=clip_obs,
+            clip_reward=clip_reward,
+        )
     return env
 

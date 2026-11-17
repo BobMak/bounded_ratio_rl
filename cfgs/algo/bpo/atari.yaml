@@ -38,3 +38,9 @@ clip_min: 0.02
 clip_max: 0.9
 # controlled-eps variant: normalized |Q-V| policy weight + separate actor/critic grad clipping
 controlled_eps: False
+# per-state ratio bound from the exact per-state KL(pi_old(s) || pi_theta(s)) during the update:
+#   null  - off
+#   mask  - drop a state from the policy loss once its KL exceeds state_kl_max
+#   scale - shrink that state's eps to eps * min(1, sqrt(state_kl_max / KL_s))
+state_clip: null
+state_kl_max: 0.05

@@ -36,3 +36,27 @@ clip_min: 0.02
 clip_max: 0.9
 # controlled-eps variant: normalized |Q-V| policy weight + separate actor/critic grad clipping
 controlled_eps: False
+# per-state ratio bound from the exact per-state KL(pi_old(s) || pi_theta(s)) during the update:
+#   null  - off
+#   mask  - drop a state from the policy loss once its KL exceeds state_kl_max
+#   scale - shrink that state's eps to eps * min(1, sqrt(state_kl_max / KL_s))
+state_clip: ${oc.select:algo.per_env.${env.env_id}.state_clip,null}
+state_kl_max: ${oc.select:algo.per_env.${env.env_id}.state_kl_max,0.05}
+# Per-env BPO defaults (keyed by env.env_id), read by cfgs/env/mujoco*.yaml (normalize, norm_obs,
+# norm_reward) and by state_clip / state_kl_max above. Explicit env.* / algo.* overrides still win.
+# From the 2026-11-16 sweeps (lambda_=0.001, 8 envs, 3+ seeds; wandb groups lambda_norm_*, walker_norm_seeds_v1,
+# hopper_norm_ablation_v1, long_5m_v1, state_clip_mujoco_v1). Final ep_rew_mean, mean over seeds:
+#   HalfCheetah  normalize: 2130 vs raw 849 (1M)       per-state bound: no gain (scale0.05 2190, within noise)
+#   Humanoid     normalize: 1396 vs raw 159 (5M)      raw obs make per-update KL explode; bound: no gain
+#   Hopper       reward-only norm 2108 > raw 1850 > full norm 1080 > obs-only 757 (obs norm hurts)
+#   Walker2d     raw 866 (8 seeds) > norm 618; mask0.05 bound 1262 vs 866
+#   Ant          norm 1884 vs raw 1735 at 5M (tie, seed spread ~250); Swimmer: everything ties (~120)
+# mask with state_kl_max=0.02 collapsed training on every env -- keep the budget >= ~2x the mean
+# per-update KL (train/kl_exact ~0.015-0.035 here).
+per_env:
+  HalfCheetah-v5: {normalize: true}
+  Humanoid-v5: {normalize: true}
+  Hopper-v5: {normalize: true, norm_obs: false}
+  Walker2d-v5: {normalize: false, state_clip: mask, state_kl_max: 0.05}
+  Ant-v5: {normalize: false}
+  Swimmer-v5: {normalize: false}

@@ -6,3 +6,9 @@ n_steps: 2048
 render_mode: "rgb_array"
 seed: ${training.seed}
 task_name: hopper
+# VecNormalize (running obs / discounted-return normalization); off by default so
+# baselines are unchanged. Per-env BPO defaults come from algo.per_env; force with env.normalize=true|false
+normalize: ${oc.select:algo.per_env.${env.env_id}.normalize,false}
+norm_obs: ${oc.select:algo.per_env.${env.env_id}.norm_obs,true}
+norm_reward: ${oc.select:algo.per_env.${env.env_id}.norm_reward,true}
+norm_gamma: ${oc.select:algo.gamma,0.99}
