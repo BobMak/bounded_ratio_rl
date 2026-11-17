@@ -66,6 +66,18 @@ class BPO(OnPolicyAlgorithm):
         divided by its minibatch mean, removing its reward-scale dependence; (2) actor and
         critic gradients are norm-clipped separately (each to ``max_grad_norm``), so the large
         value/u-loss gradients no longer shrink the actor update through a joint clip.
+    :param critic_type: "mean_median" (default: MSE mean critic V + separate median head u) or
+        "quantile" (distributional critic: one head of ``n_quantiles`` return quantiles trained with
+        the quantile-Huber loss on the GAE returns; V = mean of the atoms, u = the exact
+        lambda-smoothed median of the atoms, i.e. the root of mean_j sigmoid((z_j - u)/lambda) = 1/2,
+        which makes the target ratios average to 1 under pi_old)
+    :param n_quantiles: Number of quantile atoms for ``critic_type="quantile"``
+    :param qr_kappa: Huber threshold of the quantile-Huber loss
+    :param ratio_target: "sigmoid" (default: r* = 1 - eps + 2 eps sigmoid((G - u)/lambda)) or "cdf"
+        (r* = 1 - eps + 2 eps F_s(G), with F_s(G) = mean_j sigmoid((G - z_j)/lambda) the critic's
+        smoothed CDF of the return at the sampled return; needs the quantile critic)
+    :param dist_weight: policy-loss weight: "abs" (default: |G - V|) or "iqr" (|G - V| / IQR_s,
+        divided by its minibatch mean; scale-free, needs the quantile critic)
     :param max_grad_norm: The maximum value for the gradient clipping
     :param use_sde: Whether to use generalized State Dependent Exploration (gSDE)
         instead of action noise exploration (default: False)
@@ -121,6 +133,11 @@ class BPO(OnPolicyAlgorithm):
         controlled_eps: bool = False,
         state_clip: Optional[str] = None,
         state_kl_max: float = 0.05,
+        critic_type: str = "mean_median",
+        n_quantiles: int = 32,
+        qr_kappa: float = 1.0,
+        ratio_target: str = "sigmoid",
+        dist_weight: str = "abs",
         max_grad_norm: float = 1.0,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
@@ -134,6 +151,23 @@ class BPO(OnPolicyAlgorithm):
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
     ):
+        if critic_type not in ("mean_median", "quantile"):
+            raise ValueError(f"critic_type must be 'mean_median' or 'quantile', got {critic_type!r}")
+        if ratio_target not in ("sigmoid", "cdf"):
+            raise ValueError(f"ratio_target must be 'sigmoid' or 'cdf', got {ratio_target!r}")
+        if dist_weight not in ("abs", "iqr"):
+            raise ValueError(f"dist_weight must be 'abs' or 'iqr', got {dist_weight!r}")
+        if critic_type != "quantile" and (ratio_target == "cdf" or dist_weight == "iqr"):
+            raise ValueError("ratio_target='cdf' and dist_weight='iqr' need critic_type='quantile'")
+        if critic_type == "quantile":
+            if n_quantiles < 2:
+                raise ValueError(f"n_quantiles must be >= 2, got {n_quantiles}")
+            policy_kwargs = {**(policy_kwargs or {}), "n_quantiles": int(n_quantiles)}
+        self.critic_type = critic_type
+        self.n_quantiles = int(n_quantiles)
+        self.qr_kappa = float(qr_kappa)
+        self.ratio_target = ratio_target
+        self.dist_weight = dist_weight
         super().__init__(
             policy,
             env,
@@ -292,6 +326,40 @@ class BPO(OnPolicyAlgorithm):
         stats["kl_exact"] = th.cat(kls).mean().item() if kls and len(kls) == len(old_dists) else stats["kl_k3"]
         return stats
 
+    def _quantile_huber_loss(self, quantiles: th.Tensor, target: th.Tensor) -> th.Tensor:
+        """Quantile-Huber loss of atoms [B,N] (tau_i = (2i+1)/2N) against scalar targets [B]."""
+        n = quantiles.shape[-1]
+        tau = (th.arange(n, device=quantiles.device, dtype=quantiles.dtype) + 0.5) / n
+        u = target.unsqueeze(-1) - quantiles
+        k = self.qr_kappa
+        huber = th.where(u.abs() <= k, 0.5 * u.pow(2), k * (u.abs() - 0.5 * k))
+        return (th.abs(tau - (u.detach() < 0).float()) * huber / k).sum(-1).mean()
+
+    @th.no_grad()
+    def _smoothed_median(self, atoms: th.Tensor, temp: float, iters: int = 40) -> th.Tensor:
+        """Root u of mean_j sigmoid((z_j - u)/temp) = 1/2 per row of atoms [B,N] (bisection)."""
+        lo, hi = atoms.min(-1).values, atoms.max(-1).values
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            # f(mid) decreasing in mid; f > 1/2 -> root is to the right
+            right = th.sigmoid((atoms - mid.unsqueeze(-1)) / temp).mean(-1) > 0.5
+            lo = th.where(right, mid, lo)
+            hi = th.where(right, hi, mid)
+        return 0.5 * (lo + hi)
+
+    @staticmethod
+    def _iqr(atoms: th.Tensor) -> th.Tensor:
+        """Interquartile range [B] of quantile atoms [B,N] at midpoints tau_i = (2i+1)/2N."""
+        z, n = th.sort(atoms, dim=-1).values, atoms.shape[-1]
+
+        def q(tau: float) -> th.Tensor:
+            pos = min(max(tau * n - 0.5, 0.0), n - 1.0)
+            i0 = int(np.floor(pos))
+            i1, w = min(i0 + 1, n - 1), pos - i0
+            return (1 - w) * z[:, i0] + w * z[:, i1]
+
+        return q(0.75) - q(0.25)
+
     def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.
@@ -343,6 +411,8 @@ class BPO(OnPolicyAlgorithm):
 
         entropy_losses = []
         pg_losses, value_losses, u_losses = [], [], []
+        # distributional-critic diagnostics (last epoch)
+        cdf_vals, iqr_vals, median_gap = [], [], []
 
         continue_training = True
         self.max_adv_abs = th.tensor(0.0, device=self.device)
@@ -360,8 +430,8 @@ class BPO(OnPolicyAlgorithm):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
 
-                values, u_values, log_prob, entropy = self.policy.evaluate_actions(
-                    rollout_data.observations, actions
+                values, u_values, log_prob, entropy, quantiles = self.policy.evaluate_actions(
+                    rollout_data.observations, actions, return_quantiles=True
                 )
                 # SB3 distributions return themselves, so this is this minibatch's pi_theta
                 cur_dist = self.policy.action_dist.distribution
@@ -373,11 +443,21 @@ class BPO(OnPolicyAlgorithm):
                 # value loss function
                 q_values = rollout_data.returns.flatten()
                 target_values = rollout_data.returns.flatten()
-                value_loss = F.mse_loss(target_values, values)
+                if quantiles is not None:
+                    # distributional critic: V and u both come from the quantile atoms
+                    value_loss = self._quantile_huber_loss(quantiles, target_values)
+                else:
+                    value_loss = F.mse_loss(target_values, values)
                 value_losses.append(value_loss.detach())
 
                 # u loss
-                if self.use_median:
+                if quantiles is not None:
+                    atoms = quantiles.detach()
+                    u_smooth = self._smoothed_median(atoms, self.lambda_)
+                    adv = (q_values - u_smooth) / self.lambda_
+                    u_loss = th.zeros_like(value_loss)
+                    u_losses.append(u_loss.detach())
+                elif self.use_median:
                     adv = (q_values - u_values) / self.lambda_
                     u_loss = th.mean(
                         th.nn.functional.softplus(adv * self.lambda_)
@@ -416,11 +496,13 @@ class BPO(OnPolicyAlgorithm):
                             state_kls.append(kl_s)
                             state_clip_fracs.append(over.float().mean())
                             state_eps.append(th.as_tensor(eps_s, dtype=th.float32).mean())
-                target_ratio = (
-                    1
-                    - eps_s
-                    + 2 * eps_s * th.nn.functional.sigmoid(adv_d)
-                )
+                if self.ratio_target == "cdf":
+                    # critic's smoothed CDF of the return at the sampled return:
+                    # uniform when G ~ Z(s), so E[target_ratio] = 1 at any reward scale
+                    p_up = th.sigmoid((q_values.unsqueeze(-1) - atoms) / self.lambda_).mean(-1)
+                else:
+                    p_up = th.nn.functional.sigmoid(adv_d)
+                target_ratio = 1 - eps_s + 2 * eps_s * p_up
                 target_log_ratio = th.log(target_ratio)
                 log_ratio = log_prob.flatten() - rollout_data.old_log_prob.flatten()
                 ratio = th.exp(log_ratio)
@@ -434,6 +516,17 @@ class BPO(OnPolicyAlgorithm):
                         target_mean.append(rt.mean())
                         ratio_dev.append(th.abs(r - 1).mean())
                 pg_weight = th.abs(q_values - values.detach())
+                if self.dist_weight == "iqr":
+                    iqr = self._iqr(atoms)
+                    # per-state scale-free weight; the floor keeps near-deterministic states
+                    # from dominating, the mean-normalization removes the remaining scale
+                    pg_weight = pg_weight / (iqr + 0.1 * iqr.mean() + 1e-8)
+                    pg_weight = pg_weight / (pg_weight.mean() + 1e-8)
+                if quantiles is not None and epoch == self.n_epochs - 1:
+                    with th.no_grad():
+                        cdf_vals.append(th.sigmoid((q_values.unsqueeze(-1) - atoms) / self.lambda_).mean(-1))
+                        iqr_vals.append(self._iqr(atoms).mean())
+                        median_gap.append((u_smooth - values.detach()).mean())
                 if self.controlled_eps:
                     pg_weight = pg_weight / (pg_weight.mean() + 1e-8)
                 if state_w is not None:
@@ -512,6 +605,13 @@ class BPO(OnPolicyAlgorithm):
             self.logger.record("train/state_kl_max", kl_all.max().item())
             self.logger.record("train/state_clip_frac", _mean(state_clip_fracs))
             self.logger.record("train/state_eps_mean", _mean(state_eps))
+        if cdf_vals:
+            cdf_all = th.cat(cdf_vals).float()
+            # PIT check: ~0.5 mean and ~1/12 = 0.083 variance if the critic is calibrated
+            self.logger.record("train/cdf_mean", cdf_all.mean().item())
+            self.logger.record("train/cdf_var", cdf_all.var().item())
+            self.logger.record("train/critic_iqr", _mean(iqr_vals))
+            self.logger.record("train/median_minus_mean", _mean(median_gap))
         if self.clip_controller is not None:
             next_eps = self.clip_controller.update(div["kl_exact"])
             self.logger.record("train/clip_ratio_next", next_eps)

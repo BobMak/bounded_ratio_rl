@@ -44,3 +44,12 @@ controlled_eps: False
 #   scale - shrink that state's eps to eps * min(1, sqrt(state_kl_max / KL_s))
 state_clip: null
 state_kl_max: 0.05
+# distributional critic (see sb3.BPO docstring):
+#   critic_type: mean_median (V + median head u) | quantile (n_quantiles atoms; V = mean, u = exact lambda-smoothed median)
+#   ratio_target: sigmoid (1 - eps + 2 eps sigmoid((G - u)/lambda)) | cdf (1 - eps + 2 eps F_s(G)), cdf needs quantile
+#   dist_weight: abs (|G - V|) | iqr (|G - V| / IQR_s, batch-normalized), iqr needs quantile
+critic_type: mean_median
+n_quantiles: 32
+qr_kappa: 1.0
+ratio_target: sigmoid
+dist_weight: abs

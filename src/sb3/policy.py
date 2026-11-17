@@ -49,8 +49,40 @@ class BPOPolicy(ActorCriticPolicy):
     This policy can be used with Stable Baselines3 for reinforcement learning tasks.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, n_quantiles: int = 0, **kwargs):
+        # n_quantiles > 0: distributional (quantile) critic. A single head outputs
+        # n_quantiles return quantiles at midpoints tau_i = (2i+1)/(2N); the mean critic V
+        # is their average and there is no separate median (u) network.
+        self.n_quantiles = int(n_quantiles)
         super(BPOPolicy, self).__init__(*args, **kwargs)
+
+    def _get_constructor_parameters(self) -> dict[str, Any]:
+        data = super()._get_constructor_parameters()
+        data["n_quantiles"] = self.n_quantiles
+        return data
+
+    def _critic_heads(self, latent_vf: th.Tensor):
+        """(values [B,1], u_values [B,1], quantiles [B,N] or None) from the critic latent."""
+        if self.n_quantiles > 0:
+            quantiles = self.value_net(latent_vf)
+            values = quantiles.mean(dim=-1, keepdim=True)
+            # plain median of the atoms (exact lambda-smoothed median is computed in BPO.train)
+            u_values = th.median(quantiles, dim=-1, keepdim=True).values
+            return values, u_values, quantiles
+        return self.value_net(latent_vf), self.u_net(latent_vf), None
+
+    def _latent_vf(self, obs: PyTorchObs) -> th.Tensor:
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            _, latent_vf = self.mlp_extractor(features)
+        else:
+            _, vf_features = features
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        return latent_vf
+
+    def predict_values(self, obs: PyTorchObs) -> th.Tensor:
+        """Mean value estimate [B,1] (used for GAE bootstrapping)."""
+        return self._critic_heads(self._latent_vf(obs))[0]
 
     def _build(self, lr_schedule: Schedule) -> None:
         """
@@ -87,17 +119,20 @@ class BPOPolicy(ActorCriticPolicy):
         else:
             raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
 
-        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
-        
-        # median value network
-        action_dim = get_action_dim(self.action_space)
-        u_net_list = create_mlp(
-            self.mlp_extractor.latent_dim_vf,
-            1,
-            self.net_arch["pi"],
-            self.activation_fn,
-        )
-        self.u_net = nn.Sequential(*u_net_list)
+        if self.n_quantiles > 0:
+            self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, self.n_quantiles)
+            self.u_net = None
+        else:
+            self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
+
+            # median value network
+            u_net_list = create_mlp(
+                self.mlp_extractor.latent_dim_vf,
+                1,
+                self.net_arch["pi"],
+                self.activation_fn,
+            )
+            self.u_net = nn.Sequential(*u_net_list)
         # Init weights: use orthogonal initialization
         # with small initial weight for the output
         if self.ortho_init:
@@ -110,8 +145,9 @@ class BPOPolicy(ActorCriticPolicy):
                 self.mlp_extractor: np.sqrt(2),
                 self.action_net: 0.01,
                 self.value_net: 1,
-                self.u_net: 1,
             }
+            if self.u_net is not None:
+                module_gains[self.u_net] = 1
             print(self.features_extractor)
             if not self.share_features_extractor:
                 # Note(antonin): this is to keep SB3 results
@@ -145,13 +181,12 @@ class BPOPolicy(ActorCriticPolicy):
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         # Evaluate the values for the given observations
-        values = self.value_net(latent_vf)
+        values, u_values, _ = self._critic_heads(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         if len(actions.shape) == 1:
             actions = actions.reshape((-1, 1))
-        u_values = self.u_net(latent_vf)
         actions = actions.reshape((-1, *self.action_space.shape))
         return actions, values, u_values, log_prob
     
@@ -162,26 +197,20 @@ class BPOPolicy(ActorCriticPolicy):
         :param obs: Observation
         :return: The estimated u values
         """
-        # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        if self.share_features_extractor:
-            _, latent_vf = self.mlp_extractor(features)
-        else:
-            _, vf_features = features
-            latent_vf = self.mlp_extractor.forward_critic(vf_features)
-        u_values = self.u_net(latent_vf)
-        return u_values.flatten()
+        return self._critic_heads(self._latent_vf(obs))[1].flatten()
 
     def evaluate_actions(
-        self, obs: PyTorchObs, actions: th.Tensor
-    ) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
+        self, obs: PyTorchObs, actions: th.Tensor, return_quantiles: bool = False
+    ):
         """
         Evaluate actions according to the current policy,
         given the observations.
 
         :param obs: Observation
         :param actions: Actions
-        :return: estimated value, log likelihood of taking those actions
+        :param return_quantiles: also return the critic's quantiles [B,N] (None without
+            a quantile critic) as a fifth element
+        :return: estimated value, u value, log likelihood of taking those actions
             and entropy of the action distribution.
         """
         # Preprocess the observation if needed
@@ -194,11 +223,10 @@ class BPOPolicy(ActorCriticPolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
-        values = self.value_net(latent_vf)
-        if len(actions.shape) == 1:
-            actions = actions.reshape((-1, 1))
-        u_values = self.u_net(latent_vf)
+        values, u_values, quantiles = self._critic_heads(latent_vf)
         entropy = distribution.entropy()
+        if return_quantiles:
+            return values, u_values, log_prob, entropy, quantiles
         return values, u_values, log_prob, entropy
 
 
@@ -253,6 +281,7 @@ class BPOCnnPolicy(BPOPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        n_quantiles: int = 0,
     ):
         super().__init__(
             observation_space,
@@ -272,4 +301,5 @@ class BPOCnnPolicy(BPOPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            n_quantiles=n_quantiles,
         )
