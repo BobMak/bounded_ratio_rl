@@ -14,7 +14,7 @@ from stable_baselines3.common.policies import (
     MultiInputActorCriticPolicy,
 )
 from .policy import BPOPolicy, BPOCnnPolicy
-from .adaptive_clip import AdaptiveClipController
+from .adaptive_clip import AdaptiveClipController, ClimbClipController
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.distributions import CategoricalDistribution, DiagGaussianDistribution
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
@@ -59,6 +59,16 @@ class BPO(OnPolicyAlgorithm):
         value is ``clip_ratio`` (or its schedule at progress 1); the schedule is otherwise ignored.
     :param clip_target_kl: Target per-update mean KL divergence for the adaptive bound
     :param clip_adapt_rate: Log-space step size of the controller (max factor e**rate per update)
+    :param clip_mode: Adaptive rule when ``adaptive_clip`` is on: "target" tracks
+        ``clip_target_kl``; "climb" raises eps by ``clip_climb_step`` every update and multiplies
+        it by ``clip_cut`` when the update KL exceeds ``clip_kl_ceiling`` or jumps above
+        ``clip_spike_ratio`` x its median over the last ``clip_window`` updates (then holds for
+        ``clip_cooldown`` updates). The spike test runs on KL / eps**``clip_kl_power`` so the
+        controller's own climbing (KL ~ eps**2) is not mistaken for a spike
+    :param clip_momentum: Climb mode: heavy-ball momentum on climb steps (reset by a cut)
+    :param clip_noise: Climb mode: the eps used per update is eps * exp(clip_noise * N(0, 1))
+    :param clip_rollback: Climb mode: when an update is judged unstable, also restore the
+        actor parameters from before it (the critic keeps its update)
     :param clip_min: Lower limit for the adaptive bound
     :param clip_max: Upper limit for the adaptive bound (must be < 1)
     :param controlled_eps: "Controlled eps" variant, so that the ratio bound (not gradient
@@ -128,6 +138,17 @@ class BPO(OnPolicyAlgorithm):
         adaptive_clip: bool = False,
         clip_target_kl: float = 0.02,
         clip_adapt_rate: float = 0.5,
+        clip_mode: str = "target",
+        clip_climb_step: float = 0.03,
+        clip_cut: float = 0.7,
+        clip_kl_ceiling: float = 0.5,
+        clip_spike_ratio: float = 1.5,
+        clip_window: int = 5,
+        clip_cooldown: int = 3,
+        clip_kl_power: float = 2.0,
+        clip_momentum: float = 0.0,
+        clip_noise: float = 0.0,
+        clip_rollback: bool = False,
         clip_min: float = 0.02,
         clip_max: float = 0.9,
         controlled_eps: bool = False,
@@ -237,8 +258,29 @@ class BPO(OnPolicyAlgorithm):
         self.state_clip = state_clip
         self.state_kl_max = float(state_kl_max)
         self.adaptive_clip = adaptive_clip
-        self.clip_controller: Optional[AdaptiveClipController] = None
-        if adaptive_clip:
+        if clip_mode not in ("target", "climb"):
+            raise ValueError(f"clip_mode must be 'target' or 'climb', got {clip_mode!r}")
+        self.clip_mode = clip_mode
+        self.clip_controller: Optional[Union[AdaptiveClipController, ClimbClipController]] = None
+        self.clip_rollback = bool(clip_rollback) and adaptive_clip and clip_mode == "climb"
+        self.n_rollbacks = 0
+        if adaptive_clip and clip_mode == "climb":
+            self.clip_controller = ClimbClipController(
+                init_eps=self.clip_ratio_schedule(1.0),
+                step=clip_climb_step,
+                cut=clip_cut,
+                kl_ceiling=clip_kl_ceiling,
+                spike_ratio=clip_spike_ratio,
+                window=clip_window,
+                cooldown=clip_cooldown,
+                kl_power=clip_kl_power,
+                momentum=clip_momentum,
+                noise=clip_noise,
+                seed=seed,
+                eps_min=clip_min,
+                eps_max=clip_max,
+            )
+        elif adaptive_clip:
             self.clip_controller = AdaptiveClipController(
                 init_eps=self.clip_ratio_schedule(1.0),
                 target=clip_target_kl,
@@ -376,7 +418,9 @@ class BPO(OnPolicyAlgorithm):
         else:
             # Fallback if total_timesteps not available yet
             progress_remaining = 1.0
-        if self.clip_controller is not None:
+        if isinstance(self.clip_controller, ClimbClipController):
+            clip_ratio = self.clip_controller.propose()
+        elif self.clip_controller is not None:
             clip_ratio = self.clip_controller.eps
         else:
             clip_ratio = self.clip_ratio_schedule(progress_remaining)
@@ -394,6 +438,7 @@ class BPO(OnPolicyAlgorithm):
         if isinstance(self.action_space, spaces.Discrete):
             full_actions = full_actions.long().flatten()
         old_dists = self._policy_dists(full.observations)
+        actor_snapshot = [p.detach().clone() for p in self._actor_params] if self.clip_rollback else None
 
         # per-state bound: frozen pre-update distribution parameters for every sample
         old_params = None
@@ -613,7 +658,21 @@ class BPO(OnPolicyAlgorithm):
             self.logger.record("train/critic_iqr", _mean(iqr_vals))
             self.logger.record("train/median_minus_mean", _mean(median_gap))
         if self.clip_controller is not None:
-            next_eps = self.clip_controller.update(div["kl_exact"])
+            if isinstance(self.clip_controller, ClimbClipController):
+                next_eps = self.clip_controller.update(div["kl_exact"], eps_used=clip_ratio)
+                self.logger.record("train/clip_cuts", self.clip_controller.n_cuts)
+                self.logger.record("train/clip_velocity", self.clip_controller.velocity)
+                self.logger.record("train/clip_kl_norm", self.clip_controller.history[-1] if self.clip_controller.history else float("nan"))
+                if actor_snapshot is not None and self.clip_controller.last_unstable:
+                    # discard the unstable policy step: restore the pre-update actor weights
+                    with th.no_grad():
+                        for p, p0 in zip(self._actor_params, actor_snapshot):
+                            p.copy_(p0)
+                    self.n_rollbacks += 1
+                if self.clip_rollback:
+                    self.logger.record("train/clip_rollbacks", self.n_rollbacks)
+            else:
+                next_eps = self.clip_controller.update(div["kl_exact"])
             self.logger.record("train/clip_ratio_next", next_eps)
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
